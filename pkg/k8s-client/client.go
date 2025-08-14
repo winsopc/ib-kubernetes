@@ -38,6 +38,7 @@ type Client interface {
 	PatchPod(pod *kapi.Pod, patchType types.PatchType, patchData []byte) error
 	GetNetworkAttachmentDefinition(namespace, name string) (*netapi.NetworkAttachmentDefinition, error)
 	GetRestClient() rest.Interface
+	GetNetClient() netclient.K8sCniCncfIoV1Interface
 }
 
 type client struct {
@@ -112,4 +113,9 @@ func (c *client) GetNetworkAttachmentDefinition(namespace, name string) (*netapi
 // GetRestClient returns the client rest api for k8s
 func (c *client) GetRestClient() rest.Interface {
 	return c.clientset.CoreV1().RESTClient()
+}
+
+// GetNetClient returns the network attachment definition client for NAD watcher
+func (c *client) GetNetClient() netclient.K8sCniCncfIoV1Interface {
+	return c.netClient
 }
