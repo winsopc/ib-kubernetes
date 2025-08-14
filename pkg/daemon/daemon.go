@@ -55,11 +55,20 @@ type Daemon interface {
 
 type daemon struct {
 	config            config.DaemonConfig
-	watcher           watcher.Watcher
+	podWatcher        watcher.Watcher
+	nadWatcher        watcher.Watcher // NAD watcher for network definition changes
 	kubeClient        k8sClient.Client
 	guidPool          guid.Pool
 	smClient          plugins.SubnetManagerClient
 	guidPodNetworkMap map[string]string // allocated guid mapped to the pod and network
+
+	// NAD tracking state
+	podNetworkCache map[string][]string                        // pod UID -> list of network IDs
+	networkPodCache map[string][]string                        // network ID -> list of pod UIDs
+	nadCache        map[string]*v1.NetworkAttachmentDefinition // network ID -> NAD
+
+	// Deferred cleanup tracking for running pods when NAD is deleted
+	deferredCleanup map[string][]string // pod UID -> list of network IDs to cleanup when pod terminates
 }
 
 // Temporary struct used to proceed pods' networks
@@ -109,6 +118,7 @@ func NewDaemon() (Daemon, error) {
 	}
 
 	podEventHandler := resEvenHandler.NewPodEventHandler()
+	nadEventHandler := resEvenHandler.NewNADEventHandler()
 	client, err := k8sClient.NewK8sClient()
 	if err != nil {
 		return nil, err
@@ -151,13 +161,19 @@ func NewDaemon() (Daemon, error) {
 	}
 
 	podWatcher := watcher.NewWatcher(podEventHandler, client)
+	nadWatcher := watcher.NewWatcher(nadEventHandler, client)
 	return &daemon{
 		config:            daemonConfig,
-		watcher:           podWatcher,
+		podWatcher:        podWatcher,
+		nadWatcher:        nadWatcher,
 		kubeClient:        client,
 		guidPool:          guidPool,
 		smClient:          smClient,
 		guidPodNetworkMap: make(map[string]string),
+		podNetworkCache:   make(map[string][]string),
+		networkPodCache:   make(map[string][]string),
+		nadCache:          make(map[string]*v1.NetworkAttachmentDefinition),
+		deferredCleanup:   make(map[string][]string),
 	}, nil
 }
 
@@ -289,11 +305,14 @@ func (d *daemon) runLeaderLogic() {
 
 	go wait.Until(d.AddPeriodicUpdate, time.Duration(d.config.PeriodicUpdate)*time.Second, stopPeriodicsChan)
 	go wait.Until(d.DeletePeriodicUpdate, time.Duration(d.config.PeriodicUpdate)*time.Second, stopPeriodicsChan)
+	go wait.Until(d.ProcessNADChanges, time.Duration(d.config.PeriodicUpdate)*time.Second, stopPeriodicsChan)
 	defer close(stopPeriodicsChan)
 
-	// Run Watcher in background, calling watcherStopFunc() will stop the watcher
-	watcherStopFunc := d.watcher.RunBackground()
-	defer watcherStopFunc()
+	// Run both watchers in background
+	podWatcherStopFunc := d.podWatcher.RunBackground()
+	nadWatcherStopFunc := d.nadWatcher.RunBackground()
+	defer podWatcherStopFunc()
+	defer nadWatcherStopFunc()
 
 	// Run until interrupted by os signals
 	sigChan := make(chan os.Signal, 1)
@@ -303,26 +322,16 @@ func (d *daemon) runLeaderLogic() {
 }
 
 // If network identified by networkID is IbSriov return network name and spec
-//
-//nolint:nilerr
 func (d *daemon) getIbSriovNetwork(networkID string) (string, *utils.IbSriovCniSpec, error) {
-	networkNamespace, networkName, err := utils.ParseNetworkID(networkID)
+	_, networkName, err := utils.ParseNetworkID(networkID)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to parse network id %s with error: %v", networkID, err)
 	}
 
-	// Try to get net-attach-def in backoff loop
-	var netAttInfo *v1.NetworkAttachmentDefinition
-	if err = wait.ExponentialBackoff(backoffValues, func() (bool, error) {
-		netAttInfo, err = d.kubeClient.GetNetworkAttachmentDefinition(networkNamespace, networkName)
-		if err != nil {
-			log.Warn().Msgf("failed to get networkName attachment %s with error %v",
-				networkName, err)
-			return false, nil
-		}
-		return true, nil
-	}); err != nil {
-		return "", nil, fmt.Errorf("failed to get networkName attachment %s", networkName)
+	// Try to get net-attach-def from cache first, then fallback to API
+	netAttInfo, err := d.getCachedNAD(networkID)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to get network attachment %s: %v", networkName, err)
 	}
 	log.Debug().Msgf("networkName attachment %v", netAttInfo)
 
@@ -551,7 +560,7 @@ func (d *daemon) updatePodNetworkAnnotation(pi *podNetworkInfo, removedList *[]n
 //nolint:nilerr
 func (d *daemon) AddPeriodicUpdate() {
 	log.Info().Msgf("running periodic add update")
-	addMap, _ := d.watcher.GetHandler().GetResults()
+	addMap, _ := d.podWatcher.GetHandler().GetResults()
 	addMap.Lock()
 	defer addMap.Unlock()
 	// Contains ALL pods' networks
@@ -609,6 +618,15 @@ func (d *daemon) AddPeriodicUpdate() {
 			err = d.updatePodNetworkAnnotation(pi, &removedGUIDList)
 			if err != nil {
 				log.Error().Msgf("%v", err)
+			} else {
+				// Track pod-network relationship for successful pods
+				networks := make([]string, 0, len(pi.networks))
+				for _, net := range pi.networks {
+					if utils.IsPodNetworkConfiguredWithInfiniBand(net) {
+						networks = append(networks, utils.GenerateNetworkID(net))
+					}
+				}
+				d.trackPodNetworkRelationship(pi.pod, networks)
 			}
 		}
 
@@ -678,7 +696,7 @@ func getAllPodGUIDsForNetwork(pod *kapi.Pod, networkName string) ([]net.Hardware
 //nolint:nilerr
 func (d *daemon) DeletePeriodicUpdate() {
 	log.Info().Msg("running delete periodic update")
-	_, deleteMap := d.watcher.GetHandler().GetResults()
+	_, deleteMap := d.podWatcher.GetHandler().GetResults()
 	deleteMap.Lock()
 	defer deleteMap.Unlock()
 	for networkID, podsInterface := range deleteMap.Items {
@@ -739,18 +757,332 @@ func (d *daemon) DeletePeriodicUpdate() {
 			}
 		}
 
-		for _, guidAddr := range guidList {
+		for i, guidAddr := range guidList {
 			if err = d.guidPool.ReleaseGUID(guidAddr.String()); err != nil {
 				log.Error().Msgf("%v", err)
 				continue
 			}
 
 			delete(d.guidPodNetworkMap, guidAddr.String())
+
+			// Clean up pod-network relationship tracking and process deferred cleanup
+			if i < len(pods) {
+				podUID := string(pods[i].UID)
+				d.handlePodNetworkCleanup(podUID, networkID)
+
+				// Process any deferred cleanup for this pod (since it's being deleted)
+				d.processDeferredCleanup(podUID)
+			}
 		}
 		deleteMap.UnSafeRemove(networkID)
 	}
 
 	log.Info().Msg("delete periodic update finished")
+}
+
+// ProcessNADChanges processes NAD add/update/delete events
+func (d *daemon) ProcessNADChanges() {
+	log.Debug().Msg("Processing NAD changes...")
+
+	nadHandler := d.nadWatcher.GetHandler().(*resEvenHandler.NADEventHandler)
+	addedNADs, deletedNADs := nadHandler.GetResults()
+
+	// Process added/updated NADs
+	addedNADs.Lock()
+	for networkID, nad := range addedNADs.Items {
+		nadObj := nad.(*v1.NetworkAttachmentDefinition)
+
+		log.Info().Msgf("Processing NAD change for network: %s", networkID)
+
+		// Update local NAD cache
+		d.nadCache[networkID] = nadObj
+
+		// Find all pods using this network and trigger reconfiguration
+		if podUIDs, exists := d.networkPodCache[networkID]; exists {
+			for _, podUID := range podUIDs {
+				log.Info().Msgf("NAD change affects pod: %s", podUID)
+				d.handlePodNetworkReconfiguration(podUID, networkID, nadObj)
+			}
+		}
+
+		// Remove processed item
+		addedNADs.UnSafeRemove(networkID)
+	}
+	addedNADs.Unlock()
+
+	// Process deleted NADs
+	deletedNADs.Lock()
+	for networkID := range deletedNADs.Items {
+		log.Info().Msgf("Processing NAD deletion for network: %s", networkID)
+
+		// Remove from local cache
+		delete(d.nadCache, networkID)
+
+		// Handle pods that were using this network
+		if podUIDs, exists := d.networkPodCache[networkID]; exists {
+			for _, podUID := range podUIDs {
+				log.Warn().Msgf("NAD deleted, cleaning up pod: %s", podUID)
+				d.handlePodNetworkCleanup(podUID, networkID)
+			}
+			// Clean up the network->pod mapping
+			delete(d.networkPodCache, networkID)
+		}
+
+		// Remove processed item
+		deletedNADs.UnSafeRemove(networkID)
+	}
+	deletedNADs.Unlock()
+
+	log.Debug().Msg("NAD changes processing completed")
+}
+
+// handlePodNetworkReconfiguration handles pod reconfiguration when NAD changes
+func (d *daemon) handlePodNetworkReconfiguration(podUID, networkID string, nad *v1.NetworkAttachmentDefinition) {
+	log.Info().Msgf("Reconfiguring pod %s for network %s", podUID, networkID)
+
+	// Parse the new network configuration
+	var networkSpec map[string]interface{}
+	if err := json.Unmarshal([]byte(nad.Spec.Config), &networkSpec); err != nil {
+		log.Error().Msgf("Failed to parse NAD config for %s: %v", networkID, err)
+		return
+	}
+
+	ibCniSpec, err := utils.GetIbSriovCniFromNetwork(networkSpec)
+	if err != nil {
+		log.Error().Msgf("Failed to parse IB CNI spec from NAD %s: %v", networkID, err)
+		return
+	}
+
+	// Check if we have a GUID allocated for this pod-network combination
+	guidKey := podUID + ":" + networkID
+	if currentGUID, exists := d.guidPodNetworkMap[guidKey]; exists {
+		// Update subnet manager with new PKey if changed
+		if ibCniSpec.PKey != "" {
+			pKey, err := utils.ParsePKey(ibCniSpec.PKey)
+			if err != nil {
+				log.Error().Msgf("Failed to parse new PKey %s for network %s: %v", ibCniSpec.PKey, networkID, err)
+				return
+			}
+
+			// Convert GUID string to hardware address
+			guidAddr, err := net.ParseMAC(currentGUID)
+			if err != nil {
+				log.Error().Msgf("Failed to parse GUID %s as MAC address: %v", currentGUID, err)
+				return
+			}
+
+			// Add GUID to new PKey
+			if err := d.smClient.AddGuidsToPKey(pKey, []net.HardwareAddr{guidAddr}); err != nil {
+				log.Error().Msgf("Failed to add GUID %s to new PKey %d: %v", currentGUID, pKey, err)
+				return
+			}
+
+			log.Info().Msgf("Successfully updated PKey for pod %s network %s to %s", podUID, networkID, ibCniSpec.PKey)
+		}
+	}
+}
+
+// handlePodNetworkCleanup handles cleanup when NAD is deleted
+func (d *daemon) handlePodNetworkCleanup(podUID, networkID string) {
+	log.Info().Msgf("Processing cleanup for pod %s and deleted network %s", podUID, networkID)
+
+	// Check if pod is still running by fetching its current state
+	pod, err := d.getPodByUID(podUID)
+	if err != nil {
+		log.Warn().Msgf("Could not fetch pod %s, proceeding with cleanup: %v", podUID, err)
+		// If we can't fetch the pod, assume it's deleted and proceed with cleanup
+		d.performPodNetworkCleanup(podUID, networkID)
+		return
+	}
+
+	// If pod is still running and not terminating, defer cleanup
+	if !utils.PodIsTerminating(pod) && utils.PodIsRunning(pod) {
+		log.Info().Msgf("Pod %s is still running, deferring cleanup for network %s until pod deletion", podUID, networkID)
+		d.addToDeferredCleanup(podUID, networkID)
+
+		// Only remove from NAD cache and network->pod mapping, but preserve GUID allocation
+		if networks, exists := d.podNetworkCache[podUID]; exists {
+			// Remove this network from the pod's network list
+			for i, netID := range networks {
+				if netID == networkID {
+					d.podNetworkCache[podUID] = append(networks[:i], networks[i+1:]...)
+					break
+				}
+			}
+		}
+		return
+	}
+
+	// Pod is terminating or deleted, perform full cleanup
+	log.Info().Msgf("Pod %s is terminating/deleted, performing full cleanup for network %s", podUID, networkID)
+	d.performPodNetworkCleanup(podUID, networkID)
+}
+
+// performPodNetworkCleanup performs the actual cleanup operations
+func (d *daemon) performPodNetworkCleanup(podUID, networkID string) {
+	log.Info().Msgf("Performing cleanup for pod %s and network %s", podUID, networkID)
+
+	// Remove GUID allocation
+	guidKey := podUID + ":" + networkID
+	if guid, exists := d.guidPodNetworkMap[guidKey]; exists {
+		// Convert GUID string to hardware address for SM operations
+		if _, err := net.ParseMAC(guid); err != nil {
+			log.Error().Msgf("Failed to parse GUID %s as MAC address: %v", guid, err)
+		} else {
+			// Note: We can't remove from specific PKey since NAD is deleted
+			// The subnet manager should handle orphaned GUIDs
+			log.Info().Msgf("GUID %s for pod %s network %s will be cleaned up by subnet manager", guid, podUID, networkID)
+		}
+
+		// Return GUID to pool
+		if err := d.guidPool.ReleaseGUID(guid); err != nil {
+			log.Error().Msgf("Failed to release GUID %s to pool: %v", guid, err)
+		}
+
+		// Remove from tracking
+		delete(d.guidPodNetworkMap, guidKey)
+	}
+
+	// Update pod->network cache
+	if networks, exists := d.podNetworkCache[podUID]; exists {
+		// Remove this network from the pod's network list
+		for i, netID := range networks {
+			if netID == networkID {
+				d.podNetworkCache[podUID] = append(networks[:i], networks[i+1:]...)
+				break
+			}
+		}
+	}
+
+	// Remove from deferred cleanup if it was there
+	d.removeFromDeferredCleanup(podUID, networkID)
+}
+
+// getPodByUID fetches a pod by its UID from the Kubernetes API
+func (d *daemon) getPodByUID(podUID string) (*kapi.Pod, error) {
+	// Get all pods and find the one with matching UID
+	pods, err := d.kubeClient.GetPods(kapi.NamespaceAll)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get pods from API: %v", err)
+	}
+
+	for _, pod := range pods.Items {
+		if string(pod.UID) == podUID {
+			return &pod, nil
+		}
+	}
+
+	return nil, fmt.Errorf("pod with UID %s not found", podUID)
+}
+
+// addToDeferredCleanup adds a network to the deferred cleanup list for a pod
+func (d *daemon) addToDeferredCleanup(podUID, networkID string) {
+	if networks, exists := d.deferredCleanup[podUID]; exists {
+		// Check if network is already in the list
+		for _, netID := range networks {
+			if netID == networkID {
+				return // Already exists
+			}
+		}
+		// Add to existing list
+		d.deferredCleanup[podUID] = append(networks, networkID)
+	} else {
+		// Create new list
+		d.deferredCleanup[podUID] = []string{networkID}
+	}
+	log.Info().Msgf("Added network %s to deferred cleanup for pod %s", networkID, podUID)
+}
+
+// removeFromDeferredCleanup removes a network from the deferred cleanup list for a pod
+func (d *daemon) removeFromDeferredCleanup(podUID, networkID string) {
+	if networks, exists := d.deferredCleanup[podUID]; exists {
+		for i, netID := range networks {
+			if netID == networkID {
+				d.deferredCleanup[podUID] = append(networks[:i], networks[i+1:]...)
+				log.Info().Msgf("Removed network %s from deferred cleanup for pod %s", networkID, podUID)
+
+				// If no more networks to cleanup for this pod, remove the pod entry
+				if len(d.deferredCleanup[podUID]) == 0 {
+					delete(d.deferredCleanup, podUID)
+				}
+				break
+			}
+		}
+	}
+}
+
+// processDeferredCleanup processes deferred cleanup when a pod is deleted
+func (d *daemon) processDeferredCleanup(podUID string) {
+	if networks, exists := d.deferredCleanup[podUID]; exists {
+		log.Info().Msgf("Processing deferred cleanup for pod %s with %d networks", podUID, len(networks))
+
+		for _, networkID := range networks {
+			log.Info().Msgf("Performing deferred cleanup for pod %s network %s", podUID, networkID)
+			d.performPodNetworkCleanup(podUID, networkID)
+		}
+
+		// Remove the pod from deferred cleanup
+		delete(d.deferredCleanup, podUID)
+	}
+}
+
+// trackPodNetworkRelationship maintains bidirectional mapping between pods and networks
+func (d *daemon) trackPodNetworkRelationship(pod *kapi.Pod, networks []string) {
+	podUID := string(pod.UID)
+
+	// Update pod->networks mapping
+	d.podNetworkCache[podUID] = networks
+
+	// Update network->pods mapping
+	for _, networkID := range networks {
+		if pods, exists := d.networkPodCache[networkID]; exists {
+			// Add pod to existing list if not already present
+			found := false
+			for _, existingPodUID := range pods {
+				if existingPodUID == podUID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				d.networkPodCache[networkID] = append(pods, podUID)
+			}
+		} else {
+			// Create new list with this pod
+			d.networkPodCache[networkID] = []string{podUID}
+		}
+	}
+}
+
+// getCachedNAD retrieves NAD from cache, falling back to API if not cached
+func (d *daemon) getCachedNAD(networkID string) (*v1.NetworkAttachmentDefinition, error) {
+	// First check cache
+	if nad, exists := d.nadCache[networkID]; exists {
+		return nad, nil
+	}
+
+	// Fall back to API call (existing behavior)
+	networkNamespace, networkName, err := utils.ParseNetworkID(networkID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse network id %s with error: %v", networkID, err)
+	}
+
+	var netAttInfo *v1.NetworkAttachmentDefinition
+	if err = wait.ExponentialBackoff(backoffValues, func() (bool, error) {
+		netAttInfo, err = d.kubeClient.GetNetworkAttachmentDefinition(networkNamespace, networkName)
+		if err != nil {
+			log.Warn().Msgf("failed to get network attachment %s with error %v", networkName, err)
+			return false, err
+		}
+		return true, nil
+	}); err != nil {
+		return nil, fmt.Errorf("failed to get network attachment %s", networkName)
+	}
+
+	// Cache the result
+	d.nadCache[networkID] = netAttInfo
+
+	return netAttInfo, nil
 }
 
 // initPool check the guids that are already allocated by the running pods

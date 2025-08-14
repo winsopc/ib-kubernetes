@@ -59,6 +59,11 @@ func PodIsRunning(pod *kapi.Pod) bool {
 	return pod.Status.Phase == kapi.PodRunning
 }
 
+// PodIsTerminating check if pod is being deleted (has DeletionTimestamp)
+func PodIsTerminating(pod *kapi.Pod) bool {
+	return pod.DeletionTimestamp != nil
+}
+
 // IsPodNetworkConfiguredWithInfiniBand check if pod is already InfiniBand supported
 func IsPodNetworkConfiguredWithInfiniBand(network *v1.NetworkSelectionElement) bool {
 	if network == nil || network.CNIArgs == nil {
