@@ -158,11 +158,11 @@ func (p *podEventHandler) OnDelete(obj interface{}) {
 			continue
 		}
 
-		// check if pod network has guid
+		// PF-mode pods (partition-managed) have no GUID in cni-args — still queue for delete.
+		// VF-mode pods have a GUID. Both should be queued for cleanup.
 		if !utils.PodNetworkHasGUID(network) {
-			log.Error().Msgf("pod %s has network %s marked as configured with InfiniBand without having guid",
+			log.Debug().Msgf("pod %s network %s has no guid (PF mode), queuing for delete",
 				pod.Name, network.Name)
-			continue
 		}
 
 		networkID := utils.GenerateNetworkID(network)
