@@ -144,10 +144,12 @@ func newNicoPlugin() (*nicoPlugin, error) {
 	}
 
 	// Create SDK client configuration
+	// NGC production uses /forge/ API path; SDK defaults to /carbide/.
 	config := simple.ClientConfig{
 		BaseURL: conf.BaseURL,
 		Org:     conf.Org,
 		Token:   conf.Token,
+		APIName: "forge",
 	}
 
 	log.Info().Msgf("Initializing NICO client for org: %s", conf.Org)
