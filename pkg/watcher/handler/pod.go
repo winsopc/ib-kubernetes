@@ -166,13 +166,26 @@ func (p *podEventHandler) OnDelete(obj interface{}) {
 		}
 
 		networkID := utils.GenerateNetworkID(network)
-		pods, ok := p.deletedPods.Get(networkID)
-		if !ok {
-			pods = []*kapi.Pod{pod}
-		} else {
-			pods = append(pods.([]*kapi.Pod), pod)
+		var pods []*kapi.Pod
+		if existing, ok := p.deletedPods.Get(networkID); ok {
+			pods = existing.([]*kapi.Pod)
+			// Dedup by UID only when the pod actually has one. Tests may
+			// construct bare pods without a UID; in that case, fall through
+			// to append so we don't collapse distinct test pods into one.
+			if pod.UID != "" {
+				alreadyQueued := false
+				for _, queued := range pods {
+					if queued.UID == pod.UID {
+						alreadyQueued = true
+						break
+					}
+				}
+				if alreadyQueued {
+					continue
+				}
+			}
 		}
-		p.deletedPods.Set(networkID, pods)
+		p.deletedPods.Set(networkID, append(pods, pod))
 	}
 
 	log.Info().Msgf("successfully deleted namespace %s name %s", pod.Namespace, pod.Name)
