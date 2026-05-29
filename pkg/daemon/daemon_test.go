@@ -165,7 +165,7 @@ var _ = Describe("Daemon", func() {
 	var (
 		mockClient    *mockSMClient
 		guidPool      guid.Pool
-		testDaemon    *daemon
+		testPodCtrl   *podController
 		testGUID      = "02:00:00:00:00:00:00:01"
 		testPKey      = "0x1234"
 		testUID       = types.UID("test-pod-uid")
@@ -190,18 +190,18 @@ var _ = Describe("Daemon", func() {
 		guidPool, err = guid.NewPool(poolConfig)
 		Expect(err).ToNot(HaveOccurred())
 
-		testDaemon = &daemon{
+		testPodCtrl = &podController{
+			smClient:          mockClient,
 			guidPool:          guidPool,
 			guidPodNetworkMap: make(map[string]string),
-			smClient:          mockClient,
 		}
 	})
 
 	Context("allocatePodNetworkGUID", func() {
 		It("allocates new GUID successfully", func() {
-			err := testDaemon.allocatePodNetworkGUID(testGUID, testNetworkID, testUID, testPKey)
+			err := testPodCtrl.allocatePodNetworkGUID(testGUID, testNetworkID, testUID, testPKey)
 			Expect(err).ToNot(HaveOccurred())
-			Expect(testDaemon.guidPodNetworkMap[testGUID]).To(Equal(testNetworkID))
+			Expect(testPodCtrl.guidPodNetworkMap[testGUID]).To(Equal(testNetworkID))
 
 			pkey, err := guidPool.Get(testGUID)
 			Expect(err).ToNot(HaveOccurred())
@@ -209,17 +209,17 @@ var _ = Describe("Daemon", func() {
 		})
 
 		It("returns error when GUID already allocated to different network", func() {
-			testDaemon.guidPodNetworkMap[testGUID] = "different-network"
+			testPodCtrl.guidPodNetworkMap[testGUID] = "different-network"
 
-			err := testDaemon.allocatePodNetworkGUID(testGUID, testNetworkID, testUID, testPKey)
+			err := testPodCtrl.allocatePodNetworkGUID(testGUID, testNetworkID, testUID, testPKey)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("already allocated"))
 		})
 
 		It("succeeds when GUID already allocated to same network", func() {
-			testDaemon.guidPodNetworkMap[testGUID] = testNetworkID
+			testPodCtrl.guidPodNetworkMap[testGUID] = testNetworkID
 
-			err := testDaemon.allocatePodNetworkGUID(testGUID, testNetworkID, testUID, testPKey)
+			err := testPodCtrl.allocatePodNetworkGUID(testGUID, testNetworkID, testUID, testPKey)
 			Expect(err).ToNot(HaveOccurred())
 		})
 
@@ -227,12 +227,12 @@ var _ = Describe("Daemon", func() {
 			oldPKey := "0x5678"
 			err := guidPool.AllocateGUID(testGUID, oldPKey)
 			Expect(err).ToNot(HaveOccurred())
-			testDaemon.guidPodNetworkMap[testGUID] = "old-network"
+			testPodCtrl.guidPodNetworkMap[testGUID] = "old-network"
 
-			err = testDaemon.allocatePodNetworkGUID(testGUID, testNetworkID, testUID, testPKey)
+			err = testPodCtrl.allocatePodNetworkGUID(testGUID, testNetworkID, testUID, testPKey)
 			Expect(err).ToNot(HaveOccurred())
 
-			Expect(testDaemon.guidPodNetworkMap[testGUID]).To(Equal(testNetworkID))
+			Expect(testPodCtrl.guidPodNetworkMap[testGUID]).To(Equal(testNetworkID))
 			pkey, err := guidPool.Get(testGUID)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(pkey).To(Equal(testPKey))
@@ -243,7 +243,7 @@ var _ = Describe("Daemon", func() {
 			oldPKey := "0x5678"
 			err := guidPool.AllocateGUID(testGUID, oldPKey)
 			Expect(err).ToNot(HaveOccurred())
-			testDaemon.guidPodNetworkMap[testGUID] = "old-network"
+			testPodCtrl.guidPodNetworkMap[testGUID] = "old-network"
 
 			// Make the mock fail first few times then succeed to avoid infinite backoff
 			mockClient.removeGuidsFromPKeyError = fmt.Errorf("sm error")
@@ -254,7 +254,7 @@ var _ = Describe("Daemon", func() {
 		})
 
 		It("returns error for invalid GUID format", func() {
-			err := testDaemon.allocatePodNetworkGUID("invalid-guid", testNetworkID, testUID, testPKey)
+			err := testPodCtrl.allocatePodNetworkGUID("invalid-guid", testNetworkID, testUID, testPKey)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("failed to allocate GUID"))
 		})
@@ -294,7 +294,7 @@ var _ = Describe("Daemon", func() {
 
 		BeforeEach(func() {
 			mockK8sClient = &k8sMocks.Client{}
-			testDaemon.kubeClient = mockK8sClient
+			testPodCtrl.kubeClient = mockK8sClient
 		})
 
 		It("successfully initializes GUID pool from running pods", func() {
@@ -325,7 +325,7 @@ var _ = Describe("Daemon", func() {
 			// and then syncs with an empty SM (all GUIDs are new)
 			mockClient.listGuidsInUseResult = map[string]string{}
 
-			err := testDaemon.initGUIDPool()
+			err := testPodCtrl.initGUIDPool()
 			Expect(err).ToNot(HaveOccurred())
 
 			// In this scenario:
@@ -333,7 +333,7 @@ var _ = Describe("Daemon", func() {
 			// 2. SM sync finds no GUIDs in use
 			// 3. Cleanup phase removes the GUID from map (since not in SM)
 			// This verifies the cleanup logic works as expected
-			Expect(testDaemon.guidPodNetworkMap).To(BeEmpty())
+			Expect(testPodCtrl.guidPodNetworkMap).To(BeEmpty())
 
 			mockK8sClient.AssertExpectations(GinkgoT())
 		})
@@ -346,19 +346,19 @@ var _ = Describe("Daemon", func() {
 			mockK8sClient.On("GetPods", kapi.NamespaceAll).Return(podList, nil)
 
 			// Pre-populate the map as if a pod was processed earlier
-			testDaemon.guidPodNetworkMap["02:00:00:00:00:00:00:05"] = "existing-pod-network"
+			testPodCtrl.guidPodNetworkMap["02:00:00:00:00:00:00:05"] = "existing-pod-network"
 
 			// SM reports this GUID as in use
 			mockClient.listGuidsInUseResult = map[string]string{
 				"02:00:00:00:00:00:00:05": "0x1000",
 			}
 
-			err := testDaemon.initGUIDPool()
+			err := testPodCtrl.initGUIDPool()
 			Expect(err).ToNot(HaveOccurred())
 
 			// GUID should be preserved since SM reports it as in use
-			Expect(testDaemon.guidPodNetworkMap).To(HaveKey("02:00:00:00:00:00:00:05"))
-			Expect(testDaemon.guidPodNetworkMap["02:00:00:00:00:00:00:05"]).To(Equal("existing-pod-network"))
+			Expect(testPodCtrl.guidPodNetworkMap).To(HaveKey("02:00:00:00:00:00:00:05"))
+			Expect(testPodCtrl.guidPodNetworkMap["02:00:00:00:00:00:00:05"]).To(Equal("existing-pod-network"))
 
 			mockK8sClient.AssertExpectations(GinkgoT())
 		})
@@ -386,11 +386,11 @@ var _ = Describe("Daemon", func() {
 			mockK8sClient.On("GetPods", kapi.NamespaceAll).Return(podList, nil)
 			mockClient.listGuidsInUseResult = map[string]string{}
 
-			err := testDaemon.initGUIDPool()
+			err := testPodCtrl.initGUIDPool()
 			Expect(err).ToNot(HaveOccurred())
 
 			// Verify finished pod's GUID was not added to the map (since pod is finished)
-			Expect(testDaemon.guidPodNetworkMap).ToNot(HaveKey("02:00:00:00:00:00:00:03"))
+			Expect(testPodCtrl.guidPodNetworkMap).ToNot(HaveKey("02:00:00:00:00:00:00:03"))
 
 			mockK8sClient.AssertExpectations(GinkgoT())
 		})
@@ -417,7 +417,7 @@ var _ = Describe("Daemon", func() {
 			mockK8sClient.On("GetPods", kapi.NamespaceAll).Return(podList, nil)
 			mockClient.listGuidsInUseResult = map[string]string{}
 
-			err := testDaemon.initGUIDPool()
+			err := testPodCtrl.initGUIDPool()
 			Expect(err).ToNot(HaveOccurred()) // Should continue despite invalid annotations
 
 			mockK8sClient.AssertExpectations(GinkgoT())
@@ -426,7 +426,7 @@ var _ = Describe("Daemon", func() {
 		It("removes stale GUIDs not in subnet manager", func() {
 			// Setup: add a GUID to the map but NOT to the pool
 			// This simulates a GUID that was allocated but the pool was reset
-			testDaemon.guidPodNetworkMap["02:00:00:00:00:00:00:04"] = "stale-pod-network"
+			testPodCtrl.guidPodNetworkMap["02:00:00:00:00:00:00:04"] = "stale-pod-network"
 
 			podList := &kapi.PodList{Items: []kapi.Pod{}}
 			mockK8sClient.On("GetPods", kapi.NamespaceAll).Return(podList, nil)
@@ -434,12 +434,12 @@ var _ = Describe("Daemon", func() {
 			// SM doesn't have this GUID, so it should be cleaned up but will fail
 			mockClient.listGuidsInUseResult = map[string]string{}
 
-			err := testDaemon.initGUIDPool()
+			err := testPodCtrl.initGUIDPool()
 			Expect(err).ToNot(HaveOccurred())
 
 			// With current logic: GUID is NOT removed because pool release fails
 			// This is the conservative behavior - only remove if we can properly clean up
-			Expect(testDaemon.guidPodNetworkMap).To(HaveKey("02:00:00:00:00:00:00:04"))
+			Expect(testPodCtrl.guidPodNetworkMap).To(HaveKey("02:00:00:00:00:00:00:04"))
 
 			mockK8sClient.AssertExpectations(GinkgoT())
 		})
@@ -451,7 +451,7 @@ var _ = Describe("Daemon", func() {
 			mockK8sClient.On("GetPods", kapi.NamespaceAll).Return(&kapi.PodList{Items: []kapi.Pod{}}, nil).NotBefore(call2)
 			mockClient.listGuidsInUseResult = map[string]string{}
 
-			err := testDaemon.initGUIDPool()
+			err := testPodCtrl.initGUIDPool()
 			Expect(err).ToNot(HaveOccurred()) // Should succeed on the 3rd try
 
 			mockK8sClient.AssertExpectations(GinkgoT())
@@ -462,7 +462,7 @@ var _ = Describe("Daemon", func() {
 			mockK8sClient.On("GetPods", kapi.NamespaceAll).Return(podList, nil)
 			mockClient.listGuidsInUseError = fmt.Errorf("sm error")
 
-			err := testDaemon.initGUIDPool()
+			err := testPodCtrl.initGUIDPool()
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("sm error"))
 
@@ -502,7 +502,7 @@ var _ = Describe("Daemon", func() {
 			mockK8sClient.On("GetPods", kapi.NamespaceAll).Return(podList, nil)
 			mockClient.listGuidsInUseResult = map[string]string{}
 
-			err := testDaemon.initGUIDPool()
+			err := testPodCtrl.initGUIDPool()
 			Expect(err).ToNot(HaveOccurred())
 
 			mockK8sClient.AssertExpectations(GinkgoT())
@@ -530,7 +530,7 @@ var _ = Describe("Daemon", func() {
 				"02:00:00:00:00:00:00:32": "0x7fff",
 			}
 
-			err := testDaemon.initGUIDPool()
+			err := testPodCtrl.initGUIDPool()
 			Expect(err).ToNot(HaveOccurred())
 
 			netMap := networksMap{theMap: make(map[types.UID][]*v1.NetworkSelectionElement)}
@@ -540,7 +540,7 @@ var _ = Describe("Daemon", func() {
 
 			spec := &utils.IbSriovCniSpec{PKey: "0x7fff"}
 			for _, pi := range podNetworkInfos {
-				err = testDaemon.processNetworkGUID("ib-sriov-network", spec, pi)
+				err = testPodCtrl.processNetworkGUID("ib-sriov-network", spec, pi)
 				Expect(err).ToNot(HaveOccurred())
 			}
 
@@ -551,27 +551,27 @@ var _ = Describe("Daemon", func() {
 	Context("syncWithSubnetManager", func() {
 		It("successfully syncs with subnet manager", func() {
 			// Setup some GUIDs in the map but not in the pool (simulates post-reset state)
-			testDaemon.guidPodNetworkMap["02:00:00:00:00:00:00:06"] = "pod-network-1"
-			testDaemon.guidPodNetworkMap["02:00:00:00:00:00:00:07"] = "pod-network-2"
+			testPodCtrl.guidPodNetworkMap["02:00:00:00:00:00:00:06"] = "pod-network-1"
+			testPodCtrl.guidPodNetworkMap["02:00:00:00:00:00:00:07"] = "pod-network-2"
 
 			// SM reports only one of them as in use
 			mockClient.listGuidsInUseResult = map[string]string{
 				"02:00:00:00:00:00:00:06": "0x1000",
 			}
 
-			err := testDaemon.syncWithSubnetManager()
+			err := testPodCtrl.syncWithSubnetManager()
 			Expect(err).ToNot(HaveOccurred())
 
 			// With current logic: GUID 07 is NOT removed because pool release fails
 			// Both GUIDs remain in the map due to conservative cleanup behavior
-			Expect(testDaemon.guidPodNetworkMap).To(HaveKey("02:00:00:00:00:00:00:06"))
-			Expect(testDaemon.guidPodNetworkMap).To(HaveKey("02:00:00:00:00:00:00:07"))
+			Expect(testPodCtrl.guidPodNetworkMap).To(HaveKey("02:00:00:00:00:00:00:06"))
+			Expect(testPodCtrl.guidPodNetworkMap).To(HaveKey("02:00:00:00:00:00:00:07"))
 		})
 
 		It("handles subnet manager ListGuidsInUse error", func() {
 			mockClient.listGuidsInUseError = fmt.Errorf("sm list error")
 
-			err := testDaemon.syncWithSubnetManager()
+			err := testPodCtrl.syncWithSubnetManager()
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("sm list error"))
 		})
@@ -582,23 +582,23 @@ var _ = Describe("Daemon", func() {
 				"invalid-guid": "0x1000",
 			}
 
-			err := testDaemon.syncWithSubnetManager()
+			err := testPodCtrl.syncWithSubnetManager()
 			Expect(err).To(HaveOccurred())
 		})
 
 		It("handles GUID release error gracefully", func() {
 			// Add a GUID that's not in the pool but is in our map
 			// This simulates an inconsistent state where the map has a GUID but the pool doesn't
-			testDaemon.guidPodNetworkMap["02:00:00:00:00:00:00:08"] = "stale-network"
+			testPodCtrl.guidPodNetworkMap["02:00:00:00:00:00:00:08"] = "stale-network"
 
 			mockClient.listGuidsInUseResult = map[string]string{}
 
-			err := testDaemon.syncWithSubnetManager()
+			err := testPodCtrl.syncWithSubnetManager()
 			Expect(err).ToNot(HaveOccurred())
 
 			// GUID should NOT be removed from map if pool release fails (to prevent data loss)
 			// The daemon logs a warning but keeps the GUID in the map
-			Expect(testDaemon.guidPodNetworkMap).To(HaveKey("02:00:00:00:00:00:00:08"))
+			Expect(testPodCtrl.guidPodNetworkMap).To(HaveKey("02:00:00:00:00:00:00:08"))
 		})
 	})
 
@@ -610,17 +610,17 @@ var _ = Describe("Daemon", func() {
 			// Pre-allocate the GUID with an existing pkey
 			err := guidPool.AllocateGUID(allocatedGUID, existingPkey)
 			Expect(err).ToNot(HaveOccurred())
-			testDaemon.guidPodNetworkMap[allocatedGUID] = "existing-network"
+			testPodCtrl.guidPodNetworkMap[allocatedGUID] = "existing-network"
 
 			// Track initial call count
 			initialCallCount := mockClient.removeGuidsCallCount
 
 			// Remove the stale GUID
-			err = testDaemon.removeStaleGUID(allocatedGUID, existingPkey)
+			err = testPodCtrl.removeStaleGUID(allocatedGUID, existingPkey)
 			Expect(err).ToNot(HaveOccurred())
 
 			// Verify GUID was removed from the map
-			Expect(testDaemon.guidPodNetworkMap).ToNot(HaveKey(allocatedGUID))
+			Expect(testPodCtrl.guidPodNetworkMap).ToNot(HaveKey(allocatedGUID))
 
 			// Verify RemoveGuidsFromPKey was called exactly once
 			Expect(mockClient.removeGuidsCallCount).To(Equal(initialCallCount + 1))
@@ -630,7 +630,7 @@ var _ = Describe("Daemon", func() {
 			allocatedGUID := "02:00:00:00:00:00:00:11"
 			invalidPkey := "invalid-pkey"
 
-			err := testDaemon.removeStaleGUID(allocatedGUID, invalidPkey)
+			err := testPodCtrl.removeStaleGUID(allocatedGUID, invalidPkey)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("invalid pkey"))
 		})
@@ -639,7 +639,7 @@ var _ = Describe("Daemon", func() {
 			invalidGUID := "invalid-guid"
 			existingPkey := "0x1234"
 
-			err := testDaemon.removeStaleGUID(invalidGUID, existingPkey)
+			err := testPodCtrl.removeStaleGUID(invalidGUID, existingPkey)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("failed to parse"))
 		})
@@ -657,13 +657,13 @@ var _ = Describe("Daemon", func() {
 			// Pre-allocate the GUID
 			err := guidPool.AllocateGUID(allocatedGUID, existingPkey)
 			Expect(err).ToNot(HaveOccurred())
-			testDaemon.guidPodNetworkMap[allocatedGUID] = "existing-network"
+			testPodCtrl.guidPodNetworkMap[allocatedGUID] = "existing-network"
 
 			// Make subnet manager fail to remove
 			mockClient.removeGuidsFromPKeyError = fmt.Errorf("sm removal error")
 
 			// Should return error after retries (exponential backoff timeout)
-			err = testDaemon.removeStaleGUID(allocatedGUID, existingPkey)
+			err = testPodCtrl.removeStaleGUID(allocatedGUID, existingPkey)
 			Expect(err).To(HaveOccurred())
 			// The error is from wait.ExponentialBackoff timeout
 			Expect(err.Error()).To(Or(
@@ -676,7 +676,7 @@ var _ = Describe("Daemon", func() {
 			Expect(err).ToNot(HaveOccurred())
 
 			// GUID should still be in map since removal failed
-			Expect(testDaemon.guidPodNetworkMap).To(HaveKey(allocatedGUID))
+			Expect(testPodCtrl.guidPodNetworkMap).To(HaveKey(allocatedGUID))
 		})
 
 		It("handles pool release failure gracefully", func() {
@@ -685,10 +685,10 @@ var _ = Describe("Daemon", func() {
 
 			// Don't pre-allocate the GUID in the pool, but add to map
 			// This simulates a situation where the pool state is inconsistent
-			testDaemon.guidPodNetworkMap[allocatedGUID] = "existing-network"
+			testPodCtrl.guidPodNetworkMap[allocatedGUID] = "existing-network"
 
 			// Should successfully remove from SM but fail to release from pool
-			err := testDaemon.removeStaleGUID(allocatedGUID, existingPkey)
+			err := testPodCtrl.removeStaleGUID(allocatedGUID, existingPkey)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("failed to release guid"))
 
@@ -704,7 +704,7 @@ var _ = Describe("Daemon", func() {
 
 		BeforeEach(func() {
 			mockK8sClient = &k8sMocks.Client{}
-			testDaemon.kubeClient = mockK8sClient
+			testPodCtrl.kubeClient = mockK8sClient
 		})
 
 		It("calls syncWithSubnetManager at the end", func() {
@@ -715,18 +715,18 @@ var _ = Describe("Daemon", func() {
 			mockK8sClient.On("GetPods", kapi.NamespaceAll).Return(podList, nil)
 
 			// Pre-populate the map
-			testDaemon.guidPodNetworkMap["02:00:00:00:00:00:00:14"] = "test-network"
+			testPodCtrl.guidPodNetworkMap["02:00:00:00:00:00:00:14"] = "test-network"
 
 			// SM returns the GUID as in use
 			mockClient.listGuidsInUseResult = map[string]string{
 				"02:00:00:00:00:00:00:14": "0x1000",
 			}
 
-			err := testDaemon.initGUIDPool()
+			err := testPodCtrl.initGUIDPool()
 			Expect(err).ToNot(HaveOccurred())
 
 			// Verify that the GUID is preserved (syncWithSubnetManager was called)
-			Expect(testDaemon.guidPodNetworkMap).To(HaveKey("02:00:00:00:00:00:00:14"))
+			Expect(testPodCtrl.guidPodNetworkMap).To(HaveKey("02:00:00:00:00:00:00:14"))
 
 			mockK8sClient.AssertExpectations(GinkgoT())
 		})
@@ -738,7 +738,7 @@ var _ = Describe("Daemon", func() {
 			// Make syncWithSubnetManager fail
 			mockClient.listGuidsInUseError = fmt.Errorf("sync error")
 
-			err := testDaemon.initGUIDPool()
+			err := testPodCtrl.initGUIDPool()
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("sync error"))
 
@@ -807,10 +807,10 @@ var _ = Describe("Daemon", func() {
 	})
 
 	Context("isPartitionManagedNAD", func() {
-		var partitionDaemon *daemon
+		var partitionCtrl *partitionController
 
 		BeforeEach(func() {
-			partitionDaemon = &daemon{}
+			partitionCtrl = &partitionController{}
 		})
 
 		It("returns true when NAD has ibKubernetesEnabled set to true", func() {
@@ -823,9 +823,9 @@ var _ = Describe("Daemon", func() {
 					Config: `{"type":"ib-sriov","ibKubernetesEnabled":true,"pkey":"0x5005"}`,
 				},
 			}
-			partitionDaemon.nadCache.Store("default_ib-partition-net", nad)
+			partitionCtrl.cacheNAD("default_ib-partition-net", nad)
 
-			result := partitionDaemon.isPartitionManagedNAD("default_ib-partition-net")
+			result := partitionCtrl.IsPartitionManaged("default_ib-partition-net")
 			Expect(result).To(BeTrue())
 		})
 
@@ -839,14 +839,14 @@ var _ = Describe("Daemon", func() {
 					Config: `{"type":"ib-sriov","pkey":"0x5005"}`,
 				},
 			}
-			partitionDaemon.nadCache.Store("default_ib-legacy-net", nad)
+			partitionCtrl.cacheNAD("default_ib-legacy-net", nad)
 
-			result := partitionDaemon.isPartitionManagedNAD("default_ib-legacy-net")
+			result := partitionCtrl.IsPartitionManaged("default_ib-legacy-net")
 			Expect(result).To(BeFalse())
 		})
 
 		It("returns false when NAD is not in cache", func() {
-			result := partitionDaemon.isPartitionManagedNAD("default_nonexistent-net")
+			result := partitionCtrl.IsPartitionManaged("default_nonexistent-net")
 			Expect(result).To(BeFalse())
 		})
 
@@ -860,9 +860,9 @@ var _ = Describe("Daemon", func() {
 					Config: `{not valid json`,
 				},
 			}
-			partitionDaemon.nadCache.Store("default_ib-bad-config", nad)
+			partitionCtrl.cacheNAD("default_ib-bad-config", nad)
 
-			result := partitionDaemon.isPartitionManagedNAD("default_ib-bad-config")
+			result := partitionCtrl.IsPartitionManaged("default_ib-bad-config")
 			Expect(result).To(BeFalse())
 		})
 
@@ -876,9 +876,9 @@ var _ = Describe("Daemon", func() {
 					Config: `{"type":"ib-sriov","ibKubernetesEnabled":false,"pkey":"0x5005"}`,
 				},
 			}
-			partitionDaemon.nadCache.Store("default_ib-disabled-net", nad)
+			partitionCtrl.cacheNAD("default_ib-disabled-net", nad)
 
-			result := partitionDaemon.isPartitionManagedNAD("default_ib-disabled-net")
+			result := partitionCtrl.IsPartitionManaged("default_ib-disabled-net")
 			Expect(result).To(BeFalse())
 		})
 
@@ -892,9 +892,9 @@ var _ = Describe("Daemon", func() {
 					Config: "",
 				},
 			}
-			partitionDaemon.nadCache.Store("default_ib-empty-config", nad)
+			partitionCtrl.cacheNAD("default_ib-empty-config", nad)
 
-			result := partitionDaemon.isPartitionManagedNAD("default_ib-empty-config")
+			result := partitionCtrl.IsPartitionManaged("default_ib-empty-config")
 			Expect(result).To(BeFalse())
 		})
 
@@ -908,19 +908,19 @@ var _ = Describe("Daemon", func() {
 					Config: `{"type":"ib-sriov","ibKubernetesEnabled":true}`,
 				},
 			}
-			partitionDaemon.cacheNAD("default_ib-cached-net", nad)
+			partitionCtrl.cacheNAD("default_ib-cached-net", nad)
 			nad.Spec.Config = `{"type":"ib-sriov","ibKubernetesEnabled":false}`
 
-			result := partitionDaemon.isPartitionManagedNAD("default_ib-cached-net")
+			result := partitionCtrl.IsPartitionManaged("default_ib-cached-net")
 			Expect(result).To(BeTrue())
 		})
 	})
 
 	Context("getPartitionKeyFromNAD", func() {
-		var partitionDaemon *daemon
+		var partitionCtrl *partitionController
 
 		BeforeEach(func() {
-			partitionDaemon = &daemon{}
+			partitionCtrl = &partitionController{}
 		})
 
 		It("returns partition key from NAD annotation", func() {
@@ -936,9 +936,9 @@ var _ = Describe("Daemon", func() {
 					Config: `{"type":"ib-sriov","ibKubernetesEnabled":true,"pkey":"0x5005"}`,
 				},
 			}
-			partitionDaemon.nadCache.Store("default_ib-partition-net", nad)
+			partitionCtrl.cacheNAD("default_ib-partition-net", nad)
 
-			pkey := partitionDaemon.getPartitionKeyFromNAD("default_ib-partition-net")
+			pkey := partitionCtrl.getPartitionKeyFromNAD("default_ib-partition-net")
 			Expect(pkey).To(Equal("0x500A"))
 		})
 
@@ -955,14 +955,14 @@ var _ = Describe("Daemon", func() {
 					Config: `{"type":"ib-sriov","ibKubernetesEnabled":true}`,
 				},
 			}
-			partitionDaemon.nadCache.Store("default_ib-no-pkey-net", nad)
+			partitionCtrl.cacheNAD("default_ib-no-pkey-net", nad)
 
-			pkey := partitionDaemon.getPartitionKeyFromNAD("default_ib-no-pkey-net")
+			pkey := partitionCtrl.getPartitionKeyFromNAD("default_ib-no-pkey-net")
 			Expect(pkey).To(BeEmpty())
 		})
 
 		It("returns empty string when NAD not in cache", func() {
-			pkey := partitionDaemon.getPartitionKeyFromNAD("default_nonexistent-net")
+			pkey := partitionCtrl.getPartitionKeyFromNAD("default_nonexistent-net")
 			Expect(pkey).To(BeEmpty())
 		})
 
@@ -976,9 +976,9 @@ var _ = Describe("Daemon", func() {
 					Config: `{"type":"ib-sriov","ibKubernetesEnabled":true}`,
 				},
 			}
-			partitionDaemon.nadCache.Store("default_ib-nil-annot-net", nad)
+			partitionCtrl.cacheNAD("default_ib-nil-annot-net", nad)
 
-			pkey := partitionDaemon.getPartitionKeyFromNAD("default_ib-nil-annot-net")
+			pkey := partitionCtrl.getPartitionKeyFromNAD("default_ib-nil-annot-net")
 			Expect(pkey).To(BeEmpty())
 		})
 	})
@@ -1024,32 +1024,23 @@ var _ = Describe("Daemon", func() {
 		})
 	})
 
-	Context("daemon with fabricClient field", func() {
-		It("can be constructed with a fabricClient", func() {
+	Context("partitionController fabric client plumbing", func() {
+		It("retains the FabricClient passed via constructor", func() {
 			mock := &mockFabricClient{
 				mockSMClient: mockSMClient{name: "test-fabric"},
 			}
 
-			d := &daemon{
-				smClient:          mock,
-				fabricClient:      mock,
-				guidPodNetworkMap: make(map[string]string),
-			}
-
-			Expect(d.fabricClient).ToNot(BeNil())
-			Expect(d.smClient.Name()).To(Equal("test-fabric"))
+			pc := newPartitionController(mock, mock, nil, nil)
+			Expect(pc.fabricClient).ToNot(BeNil())
+			Expect(pc.smClient.Name()).To(Equal("test-fabric"))
 		})
 
-		It("fabricClient is nil when plugin does not implement FabricClient", func() {
+		It("nil fabricClient is preserved for legacy plugins", func() {
 			sm := &mockSMClient{name: "legacy-sm"}
 
-			d := &daemon{
-				smClient:          sm,
-				fabricClient:      nil,
-				guidPodNetworkMap: make(map[string]string),
-			}
-
-			Expect(d.fabricClient).To(BeNil())
+			pc := newPartitionController(nil, sm, nil, nil)
+			Expect(pc.fabricClient).To(BeNil())
+			Expect(pc.smClient.Name()).To(Equal("legacy-sm"))
 		})
 	})
 
@@ -1058,7 +1049,7 @@ var _ = Describe("Daemon", func() {
 
 		BeforeEach(func() {
 			mockK8sClient = &k8sMocks.Client{}
-			testDaemon.kubeClient = mockK8sClient
+			testPodCtrl.kubeClient = mockK8sClient
 		})
 
 		It("returns a non-nil error when SetAnnotationsOnPod fails", func() {
@@ -1087,7 +1078,7 @@ var _ = Describe("Daemon", func() {
 			).Return(kerrors.NewNotFound(gr, "p1"))
 
 			var removed []net.HardwareAddr
-			err := testDaemon.updatePodNetworkAnnotation(pi, &removed, "0x1234")
+			err := testPodCtrl.updatePodNetworkAnnotation(pi, &removed, "0x1234")
 
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("ns1/p1"))
@@ -1113,7 +1104,7 @@ var _ = Describe("Daemon", func() {
 			).Return(kerrors.NewNotFound(gr, "p1"))
 
 			var removed []net.HardwareAddr
-			err := testDaemon.updatePodNetworkAnnotation(pi, &removed, "")
+			err := testPodCtrl.updatePodNetworkAnnotation(pi, &removed, "")
 
 			Expect(err).To(HaveOccurred())
 			Expect(removed).To(BeEmpty())
@@ -1151,7 +1142,7 @@ var _ = Describe("Daemon", func() {
 					{Device: "mlx5_0", GUID: net.HardwareAddr{0x02, 0, 0, 0, 0, 0, 0, 0x01}},
 				},
 			}
-			d := &daemon{smClient: fabric, fabricClient: fabric, kubeClient: mockK8sClient}
+			d := &partitionController{smClient: fabric, fabricClient: fabric, kubeClient: mockK8sClient}
 			addMap := utils.NewSynchronizedMap()
 			addMap.Set("ns1_ib-net", []*kapi.Pod{newPartitionPod()})
 
@@ -1176,7 +1167,8 @@ var _ = Describe("Daemon", func() {
 				},
 			}
 			mockK8sClient.On("SetAnnotationsOnPod", pod, testifyMock.Anything).Return(nil)
-			d := &daemon{smClient: fabric, fabricClient: fabric, kubeClient: mockK8sClient}
+			d := &partitionController{smClient: fabric, fabricClient: fabric, kubeClient: mockK8sClient}
+			d.updatePodAnnotation = (&podController{kubeClient: mockK8sClient}).updatePodNetworkAnnotation
 			addMap := utils.NewSynchronizedMap()
 			addMap.Set("ns1_ib-net", []*kapi.Pod{pod})
 
@@ -1205,7 +1197,8 @@ var _ = Describe("Daemon", func() {
 			gr := schema.GroupResource{Resource: "pods"}
 			mockK8sClient.On("SetAnnotationsOnPod", pod, testifyMock.Anything).
 				Return(kerrors.NewNotFound(gr, "p1"))
-			d := &daemon{smClient: fabric, fabricClient: fabric, kubeClient: mockK8sClient}
+			d := &partitionController{smClient: fabric, fabricClient: fabric, kubeClient: mockK8sClient}
+			d.updatePodAnnotation = (&podController{kubeClient: mockK8sClient}).updatePodNetworkAnnotation
 			addMap := utils.NewSynchronizedMap()
 			addMap.Set("ns1_ib-net", []*kapi.Pod{pod})
 
@@ -1222,7 +1215,7 @@ var _ = Describe("Daemon", func() {
 		It("returns without panicking when FabricClient is absent", func() {
 			addMap := utils.NewSynchronizedMap()
 			addMap.Set("ns1_ib-net", []*kapi.Pod{newPartitionPod()})
-			d := &daemon{smClient: &mockSMClient{name: "legacy-sm"}}
+			d := &partitionController{smClient: &mockSMClient{name: "legacy-sm"}}
 
 			Expect(func() {
 				d.processPartitionPods(
@@ -1236,7 +1229,7 @@ var _ = Describe("Daemon", func() {
 
 	Context("partition-aware pod deletion", func() {
 		It("returns without panicking when FabricClient is absent", func() {
-			d := &daemon{smClient: &mockSMClient{name: "legacy-sm"}}
+			d := &partitionController{smClient: &mockSMClient{name: "legacy-sm"}}
 			d.cacheNAD("ns1_ib-net", &v1.NetworkAttachmentDefinition{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "ib-net",
@@ -1251,7 +1244,7 @@ var _ = Describe("Daemon", func() {
 			})
 
 			Expect(func() {
-				d.deletePartitionPods("ns1_ib-net", []*kapi.Pod{{
+				d.DeletePartitionPods("ns1_ib-net", []*kapi.Pod{{
 					ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "ns1"},
 					Spec:       kapi.PodSpec{NodeName: "node-1"},
 				}})
@@ -1266,7 +1259,7 @@ var _ = Describe("Daemon", func() {
 					{Device: "mlx5_1", GUID: net.HardwareAddr{0x02, 0, 0, 0, 0, 0, 0, 0x05}},
 				},
 			}
-			d := &daemon{smClient: fabric, fabricClient: fabric}
+			d := &partitionController{smClient: fabric, fabricClient: fabric}
 			d.cacheNAD("ns1_ib-net", &v1.NetworkAttachmentDefinition{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "ib-net",
@@ -1280,7 +1273,7 @@ var _ = Describe("Daemon", func() {
 				},
 			})
 
-			d.deletePartitionPods("ns1_ib-net", []*kapi.Pod{{
+			d.DeletePartitionPods("ns1_ib-net", []*kapi.Pod{{
 				ObjectMeta: metav1.ObjectMeta{Name: "p1", Namespace: "ns1"},
 				Spec:       kapi.PodSpec{NodeName: "node-1"},
 			}})
@@ -1312,7 +1305,7 @@ var _ = Describe("Daemon", func() {
 			}
 			nad := newPartitionNAD()
 			nad.Annotations = map[string]string{utils.PartitionKeyAnnotation: "0x5ac"}
-			d := &daemon{fabricClient: fabric}
+			d := &partitionController{fabricClient: fabric}
 
 			err := d.setupPartitionForNAD(nad)
 
@@ -1324,7 +1317,7 @@ var _ = Describe("Daemon", func() {
 			fabric := &mockFabricClient{mockSMClient: mockSMClient{name: "test-fabric"}}
 			nad := newPartitionNAD()
 			nad.Spec.Config = `{"type":"sriov","ibKubernetesEnabled":true}`
-			d := &daemon{fabricClient: fabric}
+			d := &partitionController{fabricClient: fabric}
 
 			err := d.setupPartitionForNAD(nad)
 
@@ -1336,7 +1329,7 @@ var _ = Describe("Daemon", func() {
 			fabric := &mockFabricClient{mockSMClient: mockSMClient{name: "test-fabric"}}
 			nad := newPartitionNAD()
 			nad.Spec.Config = `{"type":"ib-sriov","ibKubernetesEnabled":false}`
-			d := &daemon{fabricClient: fabric}
+			d := &partitionController{fabricClient: fabric}
 
 			err := d.setupPartitionForNAD(nad)
 
@@ -1359,7 +1352,7 @@ var _ = Describe("Daemon", func() {
 				Run(func(args testifyMock.Arguments) {
 					updatedNAD = args.Get(0).(*v1.NetworkAttachmentDefinition)
 				}).Return(nil)
-			d := &daemon{fabricClient: fabric, kubeClient: mockK8sClient}
+			d := &partitionController{fabricClient: fabric, kubeClient: mockK8sClient}
 
 			err := d.setupPartitionForNAD(nad)
 
@@ -1384,7 +1377,7 @@ var _ = Describe("Daemon", func() {
 				Run(func(args testifyMock.Arguments) {
 					updatedNAD = args.Get(0).(*v1.NetworkAttachmentDefinition)
 				}).Return(nil)
-			d := &daemon{fabricClient: fabric, kubeClient: mockK8sClient}
+			d := &partitionController{fabricClient: fabric, kubeClient: mockK8sClient}
 
 			err := d.handleNADDeletion(nad)
 
@@ -1414,7 +1407,7 @@ var _ = Describe("Daemon", func() {
 				Return(secondFreshNAD, nil).Once().NotBefore(update1)
 			mockK8sClient.On("UpdateNetworkAttachmentDefinition", testifyMock.Anything).
 				Return(nil).Once().NotBefore(get2)
-			d := &daemon{kubeClient: mockK8sClient}
+			d := &partitionController{kubeClient: mockK8sClient}
 
 			err := d.removeNADFinalizer(nad, utils.PartitionNADFinalizer)
 
@@ -1423,12 +1416,85 @@ var _ = Describe("Daemon", func() {
 		})
 	})
 
-	Context("getCachedNAD error type preservation", func() {
-		var mockK8sClient *k8sMocks.Client
+	Context("processNADResults handleNADDeletion gating", func() {
+		// Proves the A3 invariant from PR #228 review: a NAD entering Terminating
+		// without our PartitionNADFinalizer must NOT reach DeleteIBPartition.
+		// The finalizer is the only signal that *we* created the partition;
+		// without it the partition belongs to someone else (or never existed).
+
+		It("does not call DeleteIBPartition when the NAD lacks our finalizer", func() {
+			fabric := &mockFabricClient{mockSMClient: mockSMClient{name: "test-fabric"}}
+			pc := newPartitionController(fabric, fabric, nil, nil)
+
+			now := metav1.NewTime(time.Now())
+			nad := &v1.NetworkAttachmentDefinition{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "ib-net",
+					Namespace:         "ns1",
+					DeletionTimestamp: &now,
+					// No finalizers — someone else's NAD, we never owned it.
+				},
+				Spec: v1.NetworkAttachmentDefinitionSpec{
+					Config: `{"type":"ib-sriov","ibKubernetesEnabled":true}`,
+				},
+			}
+
+			added := utils.NewSynchronizedMap()
+			deleted := utils.NewSynchronizedMap()
+			deleted.Set("ns1_ib-net", nad)
+
+			pc.processNADResults(added, deleted)
+
+			Expect(fabric.deletePartitionCalls).To(Equal(0),
+				"DeleteIBPartition must not be called for a NAD without PartitionNADFinalizer")
+			_, stillQueued := deleted.Get("ns1_ib-net")
+			Expect(stillQueued).To(BeFalse(),
+				"queue entry should be cleared so we don't loop on a NAD we don't own")
+		})
+
+		It("calls DeleteIBPartition when the NAD carries our finalizer", func() {
+			useFastBackoff()
+			fabric := &mockFabricClient{mockSMClient: mockSMClient{name: "test-fabric"}}
+			mockK8sClient := &k8sMocks.Client{}
+			pc := newPartitionController(fabric, fabric, mockK8sClient, nil)
+
+			now := metav1.NewTime(time.Now())
+			nad := &v1.NetworkAttachmentDefinition{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "ib-net",
+					Namespace:         "ns1",
+					DeletionTimestamp: &now,
+					Finalizers:        []string{utils.PartitionNADFinalizer},
+				},
+				Spec: v1.NetworkAttachmentDefinitionSpec{
+					Config: `{"type":"ib-sriov","ibKubernetesEnabled":true}`,
+				},
+			}
+			mockK8sClient.On("GetNetworkAttachmentDefinition", "ns1", "ib-net").
+				Return(nad.DeepCopy(), nil)
+			mockK8sClient.On("UpdateNetworkAttachmentDefinition", testifyMock.Anything).
+				Return(nil)
+
+			added := utils.NewSynchronizedMap()
+			deleted := utils.NewSynchronizedMap()
+			deleted.Set("ns1_ib-net", nad)
+
+			pc.processNADResults(added, deleted)
+
+			Expect(fabric.deletePartitionCalls).To(Equal(1))
+			Expect(fabric.deletedPartitionNames).To(Equal([]string{"ns1_ib-net"}))
+		})
+	})
+
+	Context("GetCachedNAD error type preservation", func() {
+		var (
+			mockK8sClient *k8sMocks.Client
+			partitionCtrl *partitionController
+		)
 
 		BeforeEach(func() {
 			mockK8sClient = &k8sMocks.Client{}
-			testDaemon.kubeClient = mockK8sClient
+			partitionCtrl = &partitionController{kubeClient: mockK8sClient}
 		})
 
 		It("returns an error that satisfies kerrors.IsNotFound when NAD missing", func() {
@@ -1439,7 +1505,7 @@ var _ = Describe("Daemon", func() {
 				"GetNetworkAttachmentDefinition", "ns1", "n1",
 			).Return(nil, notFoundErr)
 
-			_, err := testDaemon.getCachedNAD("ns1_n1")
+			_, err := partitionCtrl.GetCachedNAD("ns1_n1")
 
 			Expect(err).To(HaveOccurred())
 			Expect(kerrors.IsNotFound(err)).To(BeTrue(),
