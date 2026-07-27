@@ -1713,6 +1713,29 @@ var _ = Describe("Daemon", func() {
 			Expect(fabric.deletePartitionCalls).To(Equal(0))
 		})
 
+		It("refreshes the NAD cache on the already-finalized fast path", func() {
+			useFastBackoff()
+			// A later add tick can re-cache the original no-finalizer snapshot
+			// after the finalizer was already persisted. The delete path prefers
+			// the cache, so the fast path must refresh it — otherwise the stale
+			// entry hides the finalizer and the partition is orphaned.
+			mockK8sClient := &k8sMocks.Client{}
+			stale := newPartitionNAD() // cached without the finalizer
+			finalized := newPartitionNAD()
+			finalized.Finalizers = []string{utils.PartitionNADFinalizer}
+			mockK8sClient.On("GetNetworkAttachmentDefinition", "ns1", "ib-net").
+				Return(finalized.DeepCopy(), nil)
+			d := &partitionController{kubeClient: mockK8sClient}
+			d.cacheNAD("ns1_ib-net", stale)
+
+			Expect(d.addNADFinalizer(stale)).To(Succeed())
+
+			cached, err := d.GetCachedNAD("ns1_ib-net")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(hasPartitionFinalizer(cached)).To(BeTrue(),
+				"already-finalized fast path must refresh the cache with the finalized NAD")
+		})
+
 		It("skips updating a NAD that already has the same PKey and finalizer", func() {
 			useFastBackoff()
 			mockK8sClient := &k8sMocks.Client{}
